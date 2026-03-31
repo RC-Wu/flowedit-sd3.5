@@ -1,0 +1,23 @@
+experiment:
+  name: flowedit_sd35_base
+  mode: stub
+  benchmark: 2d
+
+model:
+  family: sd3.5
+  checkpoint: TODO/path/to/sd3.5.ckpt
+
+pipeline:
+  edit_method: flowedit
+  guidance:
+    cfg_scale: 7.5
+    steps: 30
+
+dnaedit:
+  enabled: true
+  operator: template_operator
+  strength: 0.7
+
+runtime:
+  device: cuda
+  mixed_precision: fp16

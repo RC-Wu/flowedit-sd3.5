@@ -1,0 +1,15 @@
+case_id: dnaedit_sd35_minimal
+task: sd35_flowedit_dnaedit_2d
+description: Minimal 2D DNAEdit case template for SD3.5 FlowEdit integration.
+
+inputs:
+  source_image: data/2d/example/source.png
+  dna_prompt: "replace object texture with bio-inspired filament pattern"
+  seed: 42
+
+outputs:
+  edited_image: outputs/dnaedit_sd35_minimal.png
+
+notes:
+  - template_only: true
+  - todo: map fields to upstream 20260309 config format
