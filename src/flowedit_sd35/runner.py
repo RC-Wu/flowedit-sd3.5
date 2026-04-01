@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from PIL import Image
 
 RUNNER_VERSION = "0.2.0"
 RUNNER_TASK = "2d_sd35_flowedit_dnaedit"
@@ -79,35 +80,39 @@ def _build_stub_manifest(
     reason: str,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
+    requested = Path(str(case.get("outputs", {}).get("edited_image", "edited.png")))
+    if requested.is_absolute():
+        requested = Path(requested.name)
+    output_image_path = (output_dir / requested).resolve()
     return _write_json(
-        output_dir / "run_plan.json",
+        output_dir / "manifest.json",
         {
-            "status": "stub_only",
+            "runner_version": RUNNER_VERSION,
+            "task": RUNNER_TASK,
+            "status": "stub_unavailable",
             "reason": reason,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "case_file": str(case_path),
             "config_file": str(config_path),
-            "case": case,
-            "config": config,
+            "output_image": str(output_image_path),
+            "smoke_metrics": {
+                "metric_prefix": METRIC_PREFIX,
+                "parse_keys": [
+                    "version_tag",
+                    "gpu_peak_allocated_bytes",
+                    "gpu_peak_reserved_bytes",
+                    "edit_latency_sec",
+                ],
+            },
         },
     )
 
 
 def run_stub(case_path: Path, config_path: Path, output_dir: Path) -> Path:
-    case = _load_yaml(case_path)
-    config = _load_yaml(config_path)
-    return _build_stub_manifest(
-        case_path=case_path,
-        config_path=config_path,
-        output_dir=output_dir,
-        case=case,
-        config=config,
-        reason="stub path requested explicitly",
-    )
+    return run_case(case_path=case_path, config_path=config_path, output_dir=output_dir)
 
 
 def run_case(case_path: Path, config_path: Path, output_dir: Path) -> Path:
-    import torch
-
     case = _load_yaml(case_path)
     config = _load_yaml(config_path)
     FlowBackendConfig, FlowEditCoreBackend, import_error = _import_backend()
@@ -121,6 +126,19 @@ def run_case(case_path: Path, config_path: Path, output_dir: Path) -> Path:
             reason=f"upstream backend unavailable: {type(import_error).__name__}: {import_error}",
         )
 
+    try:
+        import torch
+        from PIL import Image
+    except Exception as exc:  # noqa: BLE001
+        return _build_stub_manifest(
+            case_path=case_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            case=case,
+            config=config,
+            reason=f"runtime dependency unavailable: {type(exc).__name__}: {exc}",
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     case_inputs = case.get("inputs", {})
@@ -129,15 +147,49 @@ def run_case(case_path: Path, config_path: Path, output_dir: Path) -> Path:
     pipeline_cfg = config.get("pipeline", {})
     dna_cfg = config.get("dnaedit", {})
 
-    source_image_path = _resolve_path(str(case_inputs["source_image"]), case_path.parent)
-    source_prompt = str(case_prompts.get("source", "")).strip()
-    target_prompt = str(case_prompts.get("target", "")).strip()
+    source_image_raw = str(case_inputs.get("source_image", "")).strip()
+    if not source_image_raw:
+        return _write_json(
+            output_dir / "manifest.json",
+            {
+                "runner_version": RUNNER_VERSION,
+                "task": RUNNER_TASK,
+                "status": "input_error",
+                "reason": "Missing case.inputs.source_image",
+                "case_file": str(case_path),
+                "config_file": str(config_path),
+            },
+        )
+    source_image_path = _resolve_path(source_image_raw, case_path.parent)
+    if not source_image_path.exists():
+        return _write_json(
+            output_dir / "manifest.json",
+            {
+                "runner_version": RUNNER_VERSION,
+                "task": RUNNER_TASK,
+                "status": "input_error",
+                "reason": f"source image not found: {source_image_path}",
+                "case_file": str(case_path),
+                "config_file": str(config_path),
+            },
+        )
+
+    source_prompt = str(case_prompts.get("source", case_inputs.get("source_prompt", ""))).strip()
+    target_prompt = str(
+        case_prompts.get(
+            "target",
+            case_inputs.get("target_prompt", case_inputs.get("dna_prompt", case.get("description", ""))),
+        )
+    ).strip()
     negative_prompt = str(case_prompts.get("negative", "")).strip()
-    output_name = Path(str(case.get("outputs", {}).get("edited_image", "edited.png"))).name
-    output_image_path = output_dir / output_name
+    output_name = Path(str(case.get("outputs", {}).get("edited_image", "edited.png")))
+    if output_name.is_absolute():
+        output_name = Path(output_name.name)
+    output_image_path = (output_dir / output_name).resolve()
+    output_image_path.parent.mkdir(parents=True, exist_ok=True)
 
     config_obj = FlowBackendConfig(
-        model_key=str(model_cfg.get("key", "sd35-medium-turbo-open")).strip(),
+        model_key=str(model_cfg.get("key", "sd35-large")).strip(),
         model_id=str(model_cfg.get("model_id", "")).strip(),
         method=str(pipeline_cfg.get("edit_method", "flowedit")).strip(),
         hf_home=str(model_cfg.get("hf_home", "")).strip(),
@@ -157,73 +209,132 @@ def run_case(case_path: Path, config_path: Path, output_dir: Path) -> Path:
 
         os.environ["EDITSPLAT_DNAEDIT_RUNTIME_ROOT"] = dna_runtime_root
 
-    image_pil = Image.open(source_image_path).convert("RGB")
-    image_t = _tensor_from_pil(image_pil)
+    try:
+        image_pil = Image.open(source_image_path).convert("RGB")
+        image_t = _tensor_from_pil(image_pil)
 
-    runtime_t0 = time.time()
-    backend = FlowEditCoreBackend(
-        config=config_obj,
-        project_root=str(Path(__file__).resolve().parents[2]),
-    )
-    device_name = str(backend.device)
-    peak_allocated = 0
-    peak_reserved = 0
-    if backend.device.type == "cuda":
-        device_name = torch.cuda.get_device_name(backend.device)
-        torch.cuda.reset_peak_memory_stats(backend.device)
+        runtime_t0 = time.time()
+        backend = FlowEditCoreBackend(
+            config=config_obj,
+            project_root=str(Path(__file__).resolve().parents[2]),
+        )
+        device_name = str(backend.device)
+        peak_allocated = 0
+        peak_reserved = 0
+        if backend.device.type == "cuda":
+            device_name = torch.cuda.get_device_name(backend.device)
+            torch.cuda.reset_peak_memory_stats(backend.device)
 
-    edited_t = backend.edit(
-        image=image_t,
-        src_prompt=source_prompt,
-        tar_prompt=target_prompt,
-        negative_prompt=negative_prompt,
-        diffusion_steps=int(pipeline_cfg.get("steps", 24)),
-        n_avg=int(pipeline_cfg.get("n_avg", 1)),
-        src_guidance_scale=float(pipeline_cfg.get("src_guidance_scale", 2.5)),
-        tar_guidance_scale=float(pipeline_cfg.get("tar_guidance_scale", 9.0)),
-        n_min=int(pipeline_cfg.get("n_min", 0)),
-        n_max=int(pipeline_cfg.get("n_max", 14)),
-        seed=int(case_inputs.get("seed", 0)),
-    )
+        edited_t = backend.edit(
+            image=image_t,
+            src_prompt=source_prompt,
+            tar_prompt=target_prompt,
+            negative_prompt=negative_prompt,
+            diffusion_steps=int(pipeline_cfg.get("steps", 24)),
+            n_avg=int(pipeline_cfg.get("n_avg", 1)),
+            src_guidance_scale=float(pipeline_cfg.get("src_guidance_scale", 2.5)),
+            tar_guidance_scale=float(pipeline_cfg.get("tar_guidance_scale", 9.0)),
+            n_min=int(pipeline_cfg.get("n_min", 0)),
+            n_max=int(pipeline_cfg.get("n_max", 14)),
+            seed=int(case_inputs.get("seed", 0)),
+        )
+        edit_latency_sec = float(time.time() - runtime_t0)
 
-    if backend.device.type == "cuda":
-        peak_allocated = int(torch.cuda.max_memory_allocated(backend.device))
-        peak_reserved = int(torch.cuda.max_memory_reserved(backend.device))
+        if backend.device.type == "cuda":
+            peak_allocated = int(torch.cuda.max_memory_allocated(backend.device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(backend.device))
 
-    _pil_from_tensor(edited_t).save(output_image_path)
-    manifest = {
-        "status": "ok",
-        "case_file": str(case_path),
-        "config_file": str(config_path),
-        "source_image": str(source_image_path),
-        "output_image": str(output_image_path),
-        "method": config_obj.method,
-        "model_key": config_obj.model_key,
-        "runtime_sec": float(time.time() - runtime_t0),
-        "backend_summary": backend.summarize(),
-        "vram": {
-            "device": device_name,
-            "adapter_gpu": int(config_obj.adapter_gpu),
-            "peak_vram_mb": peak_allocated / (1024 * 1024),
-            "allocated_vram_mb": peak_allocated / (1024 * 1024),
-            "reserved_vram_mb": peak_reserved / (1024 * 1024),
-        },
-    }
-    return _write_json(output_dir / "manifest.json", manifest)
+        _pil_from_tensor(edited_t).save(output_image_path)
+        version_tag = str(config.get("experiment", {}).get("name", model_cfg.get("family", config_obj.model_key)))
+        manifest = {
+            "runner_version": RUNNER_VERSION,
+            "task": RUNNER_TASK,
+            "status": "success",
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "case_file": str(case_path),
+            "config_file": str(config_path),
+            "source_image": str(source_image_path),
+            "output_image": str(output_image_path),
+            "method": config_obj.method,
+            "model_key": config_obj.model_key,
+            "runtime_sec": edit_latency_sec,
+            "backend_summary": backend.summarize(),
+            "smoke_metrics": {
+                "metric_prefix": METRIC_PREFIX,
+                "parse_keys": [
+                    "version_tag",
+                    "gpu_peak_allocated_bytes",
+                    "gpu_peak_reserved_bytes",
+                    "edit_latency_sec",
+                ],
+                "version_tag": version_tag,
+                "gpu_peak_allocated_bytes": peak_allocated,
+                "gpu_peak_reserved_bytes": peak_reserved,
+                "edit_latency_sec": edit_latency_sec,
+            },
+            "vram": {
+                "device": device_name,
+                "adapter_gpu": int(config_obj.adapter_gpu),
+                "peak_vram_mb": peak_allocated / (1024 * 1024),
+                "allocated_vram_mb": peak_allocated / (1024 * 1024),
+                "reserved_vram_mb": peak_reserved / (1024 * 1024),
+            },
+        }
+        print(
+            f"{METRIC_PREFIX} "
+            f"version_tag={version_tag} "
+            f"gpu_peak_allocated_bytes={peak_allocated} "
+            f"gpu_peak_reserved_bytes={peak_reserved} "
+            f"edit_latency_sec={edit_latency_sec:.6f}"
+        )
+        return _write_json(output_dir / "manifest.json", manifest)
+    except Exception as exc:  # noqa: BLE001
+        return _write_json(
+            output_dir / "manifest.json",
+            {
+                "runner_version": RUNNER_VERSION,
+                "task": RUNNER_TASK,
+                "status": "runtime_error",
+                "reason": f"{type(exc).__name__}: {exc}",
+                "case_file": str(case_path),
+                "config_file": str(config_path),
+                "source_image": str(source_image_path),
+                "output_image": str(output_image_path),
+                "smoke_metrics": {
+                    "metric_prefix": METRIC_PREFIX,
+                    "parse_keys": [
+                        "version_tag",
+                        "gpu_peak_allocated_bytes",
+                        "gpu_peak_reserved_bytes",
+                        "edit_latency_sec",
+                    ],
+                },
+            },
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Minimal real 2D flowedit-sd3.5 runner.")
+    parser = argparse.ArgumentParser(
+        description="2D single-case flowedit-sd3.5 runner (real backend if available, otherwise stub_unavailable)."
+    )
     parser.add_argument("--case", type=Path, required=True, help="Path to 2D case yaml.")
     parser.add_argument("--config", type=Path, required=True, help="Path to 2D config yaml.")
-    parser.add_argument("--output", type=Path, required=True, help="Output directory for results.")
+    parser.add_argument("--output", type=Path, required=True, help="Output directory for image + manifest.")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    result_path = run_case(args.case, args.config, args.output)
-    print(f"[flowedit-sd3.5] Result written: {result_path}")
+    manifest_path = run_case(args.case, args.config, args.output)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        print(f"[flowedit-sd3.5] status={payload.get('status')} manifest={manifest_path}")
+        if payload.get("status") == "success":
+            print(f"[flowedit-sd3.5] output_image={payload.get('output_image')}")
+        elif payload.get("reason"):
+            print(f"[flowedit-sd3.5] reason={payload.get('reason')}")
+    except Exception:  # noqa: BLE001
+        print(f"[flowedit-sd3.5] Result written: {manifest_path}")
 
 
 if __name__ == "__main__":
