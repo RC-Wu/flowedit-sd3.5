@@ -39,3 +39,7 @@ The command writes `run_plan.json` and is used as a local contract check for cas
 ```bash
 python -m unittest -v tests.test_minimal_real_2d_contract
 ```
+
+## Latest Smoke
+
+Latest real 2D smoke measurements are tracked in [docs/SMOKE_RESULTS_20260401.md](./docs/SMOKE_RESULTS_20260401.md).
