@@ -1,6 +1,6 @@
 experiment:
-  name: flowedit_sd35_base
-  mode: single_case_2d
+  name: flowedit_sd35_real_minimal
+  mode: real_2d_minimal
   benchmark: 2d
 
 model:
@@ -26,11 +26,11 @@ dnaedit:
   tar_guidance_scale: 3.5
   t_start: 13
   mvg: 0.8
+  runtime_root: ""
 
 runtime:
   device: cuda
   mixed_precision: fp16
-  record_vram: true
 
 validation:
   smoke:

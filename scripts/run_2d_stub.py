@@ -1,3 +1,5 @@
+"""2D single-case launcher (real backend when available, stub otherwise)."""
+
 from pathlib import Path
 import sys
 

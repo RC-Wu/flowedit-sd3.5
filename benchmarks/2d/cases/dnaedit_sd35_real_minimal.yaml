@@ -1,6 +1,6 @@
-case_id: dnaedit_sd35_minimal
-task: sd35_flowedit_dnaedit_2d
-description: Minimal real 2D case for SD3.5 FlowEdit/DNAEdit integration.
+case_id: dnaedit_sd35_real_minimal
+task: sd35_flowedit_dnaedit_2d_real_minimal
+description: Minimal real 2D single-case smoke for SD3.5 FlowEdit + DNAEdit.
 
 inputs:
   source_image: data/2d/example/source.png
@@ -12,7 +12,7 @@ prompts:
   negative: ""
 
 outputs:
-  edited_image: outputs/dnaedit_sd35_minimal.png
+  edited_image: outputs/dnaedit_sd35_real_minimal.png
 
 notes:
   - pure_2d_only: true

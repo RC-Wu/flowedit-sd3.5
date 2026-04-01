@@ -1,36 +1,31 @@
-# 建仓说明（v1）
+# Bootstrap 说明（纯 2D）
 
-目标：在空仓内建立可持续迭代的 `flowedit-sd3.5` 基础结构，优先承载 `2D SD3.5 FlowEdit + DNAEdit`，并预留 `3d_smoke` 诊断入口。
+目标：将仓库基线固定为 `bootstrap -> minimal real 2D path`，仅保留 SD3.5 FlowEdit + DNAEdit 的 2D 叙事与示例。
 
-## 本次完成内容
+## 本次收口内容
 
-- 创建目录骨架：
-  - `src/flowedit_sd35/`
-  - `benchmarks/2d/`
-  - `benchmarks/3d_smoke/`
-  - `docs/`
-  - `scripts/`
-- 增加最小 package 元数据：`pyproject.toml`
-- 增加最小 runner stub：
-  - `src/flowedit_sd35/runner.py`
-  - `scripts/run_2d_stub.py`
-- 增加 case/config 模板：
-  - `benchmarks/2d/cases/dnaedit_sd35_minimal.yaml`
-  - `benchmarks/2d/configs/flowedit_sd35_base.yaml`
-  - `benchmarks/3d_smoke/cases/sd35_3d_smoke_minimal.yaml`
-  - `benchmarks/3d_smoke/configs/sd35_3d_smoke_base.yaml`
-- 增加来源映射文档：`docs/ASSET_PROVENANCE.md`
-- 增加上游资产同步脚本：`scripts/sync_assets_from_editsplat.py`
+- 保留并强化纯 2D 基准目录：`benchmarks/2d/`
+- 新增真实 2D 最小示例：
+  - `benchmarks/2d/cases/dnaedit_sd35_real_minimal.yaml`
+  - `benchmarks/2d/configs/flowedit_sd35_real_minimal.yaml`
+- 新增轻量本地测试：`tests/test_minimal_real_2d_contract.py`
+  - 校验 case/config manifest 契约
+  - 校验 runner 入口契约
+  - 校验文档为纯 2D 叙事
+  - 校验 benchmark 不包含非 2D 目录
 
-## 为什么先做 stub
+## 验证要求（必须长期保持）
 
-- 当前会话中 `/dev_vepfs/...` 路径不可见，无法安全直接复制上游文件。
-- 先落稳定仓结构与配置模板，可保证后续迁移时不破坏目录组织。
-- 同步脚本已给出目标映射，路径可见后可直接执行批量导入。
+- 每个版本至少保留一个可本地执行的 2D smoke 契约检查路径（不要求拉起模型）。
+- 每个版本 smoke 必须记录显存用量（VRAM usage）。
+- 显存指标至少包含：
+  - `peak_vram_mb`
+  - `allocated_vram_mb`
+  - `reserved_vram_mb`
+- 上述要求必须在 benchmark 配置的 `validation.smoke` 字段显式声明。
 
-## 后续建议顺序
+## 本地验证命令
 
-1. 在可访问 `/dev_vepfs/...` 的环境执行 `scripts/sync_assets_from_editsplat.py`。
-2. 先打通 2D 最小链路：将 `runner.py` 从 stub 接到 SD3.5 FlowEdit + DNAEdit 真正入口。
-3. 为 `benchmarks/2d` 增加至少一个端到端 smoke test（输入图 + 配置 + 输出校验）。
-4. 将 `3d_smoke` 保持为诊断辅助，不阻塞 2D 主线迭代。
+```bash
+python -m unittest -v tests.test_minimal_real_2d_contract
+```

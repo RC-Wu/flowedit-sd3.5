@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+RUNNER_VERSION = "0.2.0"
+RUNNER_TASK = "2d_sd35_flowedit_dnaedit"
+METRIC_PREFIX = "FLOWEDIT_SD35_METRIC"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -16,41 +22,208 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _resolve_path(path_str: str, base_dir: Path) -> Path:
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
+def _import_backend():
+    errors: list[str] = []
+    try:
+        from flowedit_sd35.upstream import FlowBackendConfig, FlowEditCoreBackend
+        return FlowBackendConfig, FlowEditCoreBackend, None
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"flowedit_sd35.upstream: {type(exc).__name__}: {exc}")
+    try:
+        from flowedit_multimodel.src.core_backend import FlowBackendConfig, FlowEditCoreBackend
+        return FlowBackendConfig, FlowEditCoreBackend, None
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"flowedit_multimodel.src.core_backend: {type(exc).__name__}: {exc}")
+    return None, None, RuntimeError(" | ".join(errors))
+
+
+def _tensor_from_pil(image: Image.Image):
+    import numpy as np
+    import torch
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).contiguous()
+
+
+def _pil_from_tensor(image_t):
+    import torch
+    from PIL import Image
+
+    x = image_t[0].detach().float().cpu()
+    if x.min().item() < 0.0:
+        x = (x + 1.0) * 0.5
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    arr = (x.permute(1, 2, 0).numpy() * 255.0).astype("uint8")
+    return Image.fromarray(arr)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _build_stub_manifest(
+    case_path: Path,
+    config_path: Path,
+    output_dir: Path,
+    case: dict[str, Any],
+    config: dict[str, Any],
+    reason: str,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return _write_json(
+        output_dir / "run_plan.json",
+        {
+            "status": "stub_only",
+            "reason": reason,
+            "case_file": str(case_path),
+            "config_file": str(config_path),
+            "case": case,
+            "config": config,
+        },
+    )
+
+
 def run_stub(case_path: Path, config_path: Path, output_dir: Path) -> Path:
     case = _load_yaml(case_path)
     config = _load_yaml(config_path)
+    return _build_stub_manifest(
+        case_path=case_path,
+        config_path=config_path,
+        output_dir=output_dir,
+        case=case,
+        config=config,
+        reason="stub path requested explicitly",
+    )
+
+
+def run_case(case_path: Path, config_path: Path, output_dir: Path) -> Path:
+    import torch
+
+    case = _load_yaml(case_path)
+    config = _load_yaml(config_path)
+    FlowBackendConfig, FlowEditCoreBackend, import_error = _import_backend()
+    if import_error is not None:
+        return _build_stub_manifest(
+            case_path=case_path,
+            config_path=config_path,
+            output_dir=output_dir,
+            case=case,
+            config=config,
+            reason=f"upstream backend unavailable: {type(import_error).__name__}: {import_error}",
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    run_plan = {
-        "status": "stub_only",
-        "task": "2d_sd35_flowedit_dnaedit",
+
+    case_inputs = case.get("inputs", {})
+    case_prompts = case.get("prompts", {})
+    model_cfg = config.get("model", {})
+    pipeline_cfg = config.get("pipeline", {})
+    dna_cfg = config.get("dnaedit", {})
+
+    source_image_path = _resolve_path(str(case_inputs["source_image"]), case_path.parent)
+    source_prompt = str(case_prompts.get("source", "")).strip()
+    target_prompt = str(case_prompts.get("target", "")).strip()
+    negative_prompt = str(case_prompts.get("negative", "")).strip()
+    output_name = Path(str(case.get("outputs", {}).get("edited_image", "edited.png"))).name
+    output_image_path = output_dir / output_name
+
+    config_obj = FlowBackendConfig(
+        model_key=str(model_cfg.get("key", "sd35-medium-turbo-open")).strip(),
+        model_id=str(model_cfg.get("model_id", "")).strip(),
+        method=str(pipeline_cfg.get("edit_method", "flowedit")).strip(),
+        hf_home=str(model_cfg.get("hf_home", "")).strip(),
+        adapter_resize_side=int(model_cfg.get("adapter_resize_side", 512)),
+        adapter_gpu=int(model_cfg.get("adapter_gpu", -1)),
+        hf_token=str(model_cfg.get("hf_token", "")).strip(),
+        dna_steps=int(dna_cfg.get("steps", 40)),
+        dna_src_guidance_scale=float(dna_cfg.get("src_guidance_scale", 1.0)),
+        dna_tar_guidance_scale=float(dna_cfg.get("tar_guidance_scale", 3.5)),
+        dna_t_start=int(dna_cfg.get("t_start", 13)),
+        dna_mvg=float(dna_cfg.get("mvg", 0.8)),
+    )
+
+    dna_runtime_root = str(dna_cfg.get("runtime_root", "")).strip()
+    if dna_runtime_root:
+        import os
+
+        os.environ["EDITSPLAT_DNAEDIT_RUNTIME_ROOT"] = dna_runtime_root
+
+    image_pil = Image.open(source_image_path).convert("RGB")
+    image_t = _tensor_from_pil(image_pil)
+
+    runtime_t0 = time.time()
+    backend = FlowEditCoreBackend(
+        config=config_obj,
+        project_root=str(Path(__file__).resolve().parents[2]),
+    )
+    device_name = str(backend.device)
+    peak_allocated = 0
+    peak_reserved = 0
+    if backend.device.type == "cuda":
+        device_name = torch.cuda.get_device_name(backend.device)
+        torch.cuda.reset_peak_memory_stats(backend.device)
+
+    edited_t = backend.edit(
+        image=image_t,
+        src_prompt=source_prompt,
+        tar_prompt=target_prompt,
+        negative_prompt=negative_prompt,
+        diffusion_steps=int(pipeline_cfg.get("steps", 24)),
+        n_avg=int(pipeline_cfg.get("n_avg", 1)),
+        src_guidance_scale=float(pipeline_cfg.get("src_guidance_scale", 2.5)),
+        tar_guidance_scale=float(pipeline_cfg.get("tar_guidance_scale", 9.0)),
+        n_min=int(pipeline_cfg.get("n_min", 0)),
+        n_max=int(pipeline_cfg.get("n_max", 14)),
+        seed=int(case_inputs.get("seed", 0)),
+    )
+
+    if backend.device.type == "cuda":
+        peak_allocated = int(torch.cuda.max_memory_allocated(backend.device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(backend.device))
+
+    _pil_from_tensor(edited_t).save(output_image_path)
+    manifest = {
+        "status": "ok",
         "case_file": str(case_path),
         "config_file": str(config_path),
-        "case": case,
-        "config": config,
-        "next_todo": [
-            "Wire real SD3.5 FlowEdit pipeline.",
-            "Port DNAEdit conditioning and edit operators.",
-            "Replace stub with experiment launcher.",
-        ],
+        "source_image": str(source_image_path),
+        "output_image": str(output_image_path),
+        "method": config_obj.method,
+        "model_key": config_obj.model_key,
+        "runtime_sec": float(time.time() - runtime_t0),
+        "backend_summary": backend.summarize(),
+        "vram": {
+            "device": device_name,
+            "adapter_gpu": int(config_obj.adapter_gpu),
+            "peak_vram_mb": peak_allocated / (1024 * 1024),
+            "allocated_vram_mb": peak_allocated / (1024 * 1024),
+            "reserved_vram_mb": peak_reserved / (1024 * 1024),
+        },
     }
-    plan_file = output_dir / "run_plan.json"
-    plan_file.write_text(json.dumps(run_plan, indent=2, ensure_ascii=False), encoding="utf-8")
-    return plan_file
+    return _write_json(output_dir / "manifest.json", manifest)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Minimal flowedit-sd3.5 runner stub.")
-    parser.add_argument("--case", type=Path, required=True, help="Path to benchmark case yaml.")
-    parser.add_argument("--config", type=Path, required=True, help="Path to benchmark config yaml.")
-    parser.add_argument("--output", type=Path, required=True, help="Output directory for stub results.")
+    parser = argparse.ArgumentParser(description="Minimal real 2D flowedit-sd3.5 runner.")
+    parser.add_argument("--case", type=Path, required=True, help="Path to 2D case yaml.")
+    parser.add_argument("--config", type=Path, required=True, help="Path to 2D config yaml.")
+    parser.add_argument("--output", type=Path, required=True, help="Output directory for results.")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    plan_file = run_stub(args.case, args.config, args.output)
-    print(f"[flowedit-sd3.5] Stub run plan generated: {plan_file}")
+    result_path = run_case(args.case, args.config, args.output)
+    print(f"[flowedit-sd3.5] Result written: {result_path}")
 
 
 if __name__ == "__main__":
